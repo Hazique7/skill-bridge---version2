@@ -2,16 +2,16 @@ import { createClient } from "@/lib/supabase/server";
 import { notFound, redirect } from "next/navigation";
 import SkillCard from "./SkillCard";
 import ProgressBar from "./ProgressBar";
+import ChatWidget from "./ChatWidget";
 import { Trash2, ChevronLeft } from "lucide-react";
 import { deleteRoadmapAction } from "@/app/actions/roadmap";
 import Link from "next/link";
 
-type Props = {
-  params: Promise<{ id: string }>;
-};
+export default async function RoadmapPage(props: { params: Promise<{ id: string }> }) {
+  // Next 15+ strictly requires params to be awaited this way
+  const params = await props.params;
+  const roadmapId = params.id;
 
-export default async function RoadmapPage({ params }: Props) {
-  const { id } = await params;
   const supabase = await createClient();
 
   const { data: roadmap, error } = await supabase
@@ -23,7 +23,7 @@ export default async function RoadmapPage({ params }: Props) {
         skills (*)
       )
     `)
-    .eq("id", id)
+    .eq("id", roadmapId)
     .single();
 
   if (error || !roadmap) {
@@ -34,7 +34,7 @@ export default async function RoadmapPage({ params }: Props) {
   const totalSkills = roadmap.phases.reduce((acc: number, phase: any) => acc + (phase.skills?.length || 0), 0);
 
   return (
-    <div className="min-h-screen bg-slate-50 pb-20">
+    <main className="min-h-screen bg-slate-50 pb-20 relative">
       <ProgressBar totalSkills={totalSkills} />
 
       <div className="p-6 md:p-12 lg:p-24 pt-8">
@@ -44,7 +44,6 @@ export default async function RoadmapPage({ params }: Props) {
             <ChevronLeft className="h-4 w-4 group-hover:-translate-x-1 transition-transform" /> Back to Dashboard
           </Link>
 
-          {/* Header Section with Delete Button */}
           <div className="flex flex-col md:flex-row justify-between items-start gap-6 mb-12">
             <div className="space-y-4">
               <div className="inline-block px-3 py-1 rounded-full bg-[#ccff00]/20 text-slate-800 text-sm font-bold mb-2">
@@ -60,7 +59,7 @@ export default async function RoadmapPage({ params }: Props) {
 
             <form action={async () => {
               "use server";
-              await deleteRoadmapAction(id);
+              await deleteRoadmapAction(roadmapId);
               redirect("/dashboard");
             }}>
               <button className="flex items-center gap-2 text-sm font-bold text-slate-300 hover:text-red-500 transition-colors p-2 hover:bg-red-50 rounded-xl">
@@ -70,7 +69,6 @@ export default async function RoadmapPage({ params }: Props) {
             </form>
           </div>
 
-          {/* Timeline Section */}
           <div className="space-y-12">
             {sortedPhases.map((phase: any) => (
               <div key={phase.id} className="relative">
@@ -99,6 +97,13 @@ export default async function RoadmapPage({ params }: Props) {
           </div>
         </div>
       </div>
-    </div>
+
+      <ChatWidget 
+        roadmapContext={JSON.stringify({
+          topic: roadmap.topic,
+          phases: sortedPhases
+        })} 
+      />
+    </main>
   );
 }

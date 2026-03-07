@@ -10,34 +10,57 @@ export async function generateRoadmapAction(prevState: any, formData: FormData) 
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return { error: "Authentication required." };
 
-  // 1. FETCH THE USER'S PROFILE TO GET THEIR SETTINGS
+  // ==========================================================
+  // 1. DEDUCT CREDIT FIRST
+  // ==========================================================
+  const { data: hasCredits, error: rpcError } = await supabase.rpc('decrement_user_credit');
+
+  if (rpcError || !hasCredits) {
+    return { 
+      error: "You've used all 3 of your daily credits. Your credits will automatically reset 24 hours after your first generation." 
+    };
+  }
+
+  // 2. FETCH THE USER'S PROFILE TO GET THEIR SETTINGS
   const { data: profile } = await supabase
     .from("profiles")
     .select("current_level, weekly_hours")
     .eq("id", user.id)
     .single();
 
-  // Set defaults just in case they haven't saved a profile yet
   const userLevel = profile?.current_level || "Beginner";
   const userHours = profile?.weekly_hours || 5;
 
-  const topic = formData.get("topic") as string;
+  // ==========================================================
+  // FIX #3: OPTIONAL TOPIC IF PDF UPLOADED
+  // ==========================================================
+  let rawTopic = formData.get("topic") as string || "";
   const file = formData.get("file") as File | null;
-  const normalizedTopic = topic.toLowerCase().trim().replace(/\s+/g, "-");
 
-  // 2. CREATE A UNIQUE CACHE KEY BASED ON LEVEL AND HOURS
+  // Ensure they provided AT LEAST a topic OR a file
+  if (!rawTopic.trim() && (!file || file.size === 0)) {
+    // If we fail here, refund the credit instantly
+    await supabase.rpc('refund_user_credit');
+    return { error: "Please provide a topic to learn or upload a PDF document." };
+  }
+
+  // If they uploaded a file but left the text box empty, give it a default name
+  const topic = rawTopic.trim() || "Uploaded Document Analysis";
+  const normalizedTopic = topic.toLowerCase().replace(/\s+/g, "-");
+
   const cacheKey = `${normalizedTopic}-${userLevel.toLowerCase()}-${userHours}h`;
 
   let pdfParts: any[] = [];
   let extraContext = "";
-  
-  // Safely declare the ID outside the try block
   let finalRoadmapId: string | null = null;
 
+  // ==========================================================
+  // 3. THE MASTER TRY-CATCH BLOCK (With Auto-Refund)
+  // ==========================================================
   try {
     if (file && file.size > 0) {
       if (file.size > 5 * 1024 * 1024) {
-        return { error: "PDF exceeds 5MB limit." };
+        throw new Error("PDF exceeds 5MB limit.");
       }
 
       const arrayBuffer = await file.arrayBuffer();
@@ -54,21 +77,63 @@ export async function generateRoadmapAction(prevState: any, formData: FormData) 
     }
 
     let roadmapJson;
+    let queryEmbedding: number[] | null = null;
 
-    // Check cache using the NEW personalized cache key
+    const semanticSearchPhrase = `${topic} roadmap for a ${userLevel} studying ${userHours} hours a week`;
+
+    // ==========================================================
+    // 4. SEMANTIC CACHE CHECK (Via Hugging Face)
+    // ==========================================================
     if (pdfParts.length === 0) {
-      const { data: cached } = await supabase
-        .from("roadmap_cache")
-        .select("roadmap_json")
-        .eq("topic_hash", cacheKey)
-        .single();
+      try {
+        const hfResponse = await fetch(
+          "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction",
+          {
+            headers: { 
+              "Authorization": `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+              "Content-Type": "application/json"
+            },
+            method: "POST",
+            body: JSON.stringify({ inputs: semanticSearchPhrase }),
+          }
+        );
 
-      if (cached) roadmapJson = cached.roadmap_json;
+        if (!hfResponse.ok) {
+          throw new Error(`Hugging Face API failed: ${hfResponse.statusText}`);
+        }
+
+        const embeddingData = await hfResponse.json();
+        queryEmbedding = Array.isArray(embeddingData[0]) ? embeddingData[0] : embeddingData;
+
+        const { data: cached, error: rpcError } = await supabase.rpc('match_roadmaps', {
+          query_embedding: queryEmbedding,
+          match_threshold: 0.70,
+          match_count: 1
+        });
+
+        if (rpcError) {
+          console.error("🚨 SUPABASE RPC ERROR:", rpcError);
+        }
+
+        if (cached && cached.length > 0) {
+          console.log("🔥 Semantic Cache Hit! Similarity Score:", cached[0].similarity);
+          roadmapJson = typeof cached[0].roadmap_json === 'string' 
+            ? JSON.parse(cached[0].roadmap_json) 
+            : cached[0].roadmap_json;
+        } else {
+          console.log("🥶 Cache Miss: No similar roadmaps found.");
+        }
+        
+      } catch (embedError) {
+        console.error("⚠️ Hugging Face embedding failed:", embedError);
+      }
     }
 
-    // Generate via AI if not cached
+    // ==========================================================
+    // 5. GENERATE FRESH ROADMAP (If no cache hit)
+    // ==========================================================
     if (!roadmapJson) {
-      // 3. INJECT THE PROFILE DATA INTO THE AI PROMPT
+      console.log("Generating fresh roadmap via AI...");
       const prompt = `
         Create a highly structured learning roadmap for: "${topic}".
         
@@ -109,25 +174,57 @@ export async function generateRoadmapAction(prevState: any, formData: FormData) 
         Output ONLY raw JSON.
       `;
 
-      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "google/gemma-3-4b-it:free",
-          messages: [{ role: "user", content: [{ type: "text", text: prompt }, ...pdfParts] }],
-          plugins: [{ id: "file-parser", pdf: { engine: "pdf-text" } }]
-        })
-      });
+      // ==========================================================
+      // FIX #2: AI FALLBACK SYSTEM
+      // ==========================================================
+      const aiModelsToTry = [
+        "google/gemma-3-4b-it:free",         // 3rd choice: Original model
+        "google/gemma-3-27b-it:free",     // 1st choice: Fast & high limits
+        "qwen/qwen3-next-80b-a3b-instruct:free" // 2nd choice: Reliable fallback
+      ];
 
-      if (!response.ok) {
-        return { error: "AI generation failed. Please try again." };
+      let rawText = "";
+
+      for (const modelId of aiModelsToTry) {
+        try {
+          console.log(`🤖 Trying AI Model: ${modelId}...`);
+          const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+              "Content-Type": "application/json",
+              "HTTP-Referer": "http://localhost:3000",
+              "X-Title": "Skill-Bridge",
+            },
+            body: JSON.stringify({
+              model: modelId, 
+              messages: [{ role: "user", content: [{ type: "text", text: prompt }, ...pdfParts] }]
+            })
+          });
+
+          if (!response.ok) {
+            console.warn(`⚠️ Model ${modelId} failed (${response.status}). Swapping to fallback...`);
+            continue; // This skips to the next model in the array
+          }
+
+          const result = await response.json();
+          rawText = result.choices?.[0]?.message?.content || "";
+          
+          if (rawText) {
+            console.log(`✅ Success with ${modelId}!`);
+            break; // We got the data, exit the loop!
+          }
+
+        } catch (error) {
+          console.warn(`⚠️ Network error with ${modelId}, trying next...`);
+          continue;
+        }
       }
 
-      const result = await response.json();
-      const rawText = result.choices?.[0]?.message?.content || "";
+      if (!rawText) {
+        throw new Error("All AI models are currently busy. Please try again in a few minutes.");
+      }
+
       const cleanedText = rawText
         .replace(/```json/gi, "")
         .replace(/```/g, "")
@@ -137,15 +234,19 @@ export async function generateRoadmapAction(prevState: any, formData: FormData) 
       try {
         roadmapJson = JSON.parse(cleanedText);
       } catch {
-        return { error: "AI generated malformed JSON. Please try again." };
+        console.error("MALFORMED JSON FROM AI:", rawText); 
+        throw new Error("The AI returned malformed data. Please try again.");
       }
 
-      // YouTube API Enhancement
+      // ==========================================================
+      // FIX #1: YOUTUBE EMBEDDABLE ONLY
+      // ==========================================================
       if (process.env.YOUTUBE_API_KEY) {
         const fetchYoutubeVideo = async (query: string) => {
           try {
+            // Added &videoEmbeddable=true so it doesn't fetch locked videos
             const ytRes = await fetch(
-              `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=1&q=${encodeURIComponent(query)}&type=video&key=${process.env.YOUTUBE_API_KEY}`
+              `https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=1&q=${encodeURIComponent(query)}&type=video&videoEmbeddable=true&key=${process.env.YOUTUBE_API_KEY}`
             );
             const ytData = await ytRes.json();
 
@@ -155,7 +256,6 @@ export async function generateRoadmapAction(prevState: any, formData: FormData) 
           } catch {
             console.error("YouTube fetch error");
           }
-
           return `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
         };
 
@@ -175,16 +275,17 @@ export async function generateRoadmapAction(prevState: any, formData: FormData) 
         }
       }
 
-      // ONLY Cache if we just generated it AND there is no PDF
-      if (pdfParts.length === 0) {
+      // 6. SAVE TO CACHE WITH EMBEDDING
+      if (pdfParts.length === 0 && queryEmbedding) {
         await supabase.from("roadmap_cache").insert({
           topic_hash: cacheKey,
-          roadmap_json: roadmapJson
+          roadmap_json: roadmapJson,
+          embedding: queryEmbedding
         });
       }
     }
 
-    // ===== SAVE TO DATABASE =====
+    // Save to DB
     const { data: roadmap, error: roadmapError } = await supabase
       .from("roadmaps")
       .insert({
@@ -195,14 +296,7 @@ export async function generateRoadmapAction(prevState: any, formData: FormData) 
       .single();
 
     if (roadmapError) {
-      if (roadmapError.message.includes("Maximum 3 roadmaps")) {
-        return {
-          error: "You've reached the free tier limit of 3 roadmaps per 24 hours. Please try again tomorrow!"
-        };
-      }
-      return {
-        error: roadmapError.message || "Failed to create roadmap."
-      };
+      throw new Error(`Database Error: ${roadmapError.message}`);
     }
 
     // Insert Phases + Skills
@@ -231,14 +325,15 @@ export async function generateRoadmapAction(prevState: any, formData: FormData) 
       }
     }
     
-    // Safely assign the ID to our scoped variable
     finalRoadmapId = roadmap.id;
 
   } catch (err: any) {
-    return { error: err.message || "Something went wrong." };
+    // 4. AUTOMATIC REFUND ON ERROR
+    await supabase.rpc('refund_user_credit');
+    console.error("🚀 GENERATION CRASHED:", err);
+    return { error: err.message || "An unexpected error occurred. Your credit has been refunded." };
   }
 
-  // Redirect safely outside the try/catch
   if (finalRoadmapId) {
     redirect(`/roadmap/${finalRoadmapId}`);
   }
@@ -256,7 +351,7 @@ export async function deleteRoadmapAction(roadmapId: string) {
     throw new Error("Failed to delete roadmap.");
   }
 
-  // Revalidate the cache first so the deleted item vanishes immediately
   revalidatePath("/dashboard");
   redirect("/dashboard");
 }
+

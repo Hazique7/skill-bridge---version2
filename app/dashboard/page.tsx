@@ -4,6 +4,7 @@ import Link from "next/link";
 import { Plus, Map, Trash2, Clock, ChevronRight, LogOut } from "lucide-react";
 import { deleteRoadmapAction } from "@/app/actions/roadmap";
 import { revalidatePath } from "next/cache";
+import { Key } from "react";
 
 export default async function DashboardPage() {
   const supabase = await createClient();
@@ -24,16 +25,25 @@ export default async function DashboardPage() {
     .select("*", { count: 'exact', head: true })
     .eq("user_id", user.id);
 
+  // Fetch the user's remaining credits
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("credits")
+    .eq("id", user.id)
+    .single();
+
+  // If they are brand new and the DB hasn't set it yet, default to 3
+  const remainingCredits = profile?.credits ?? 3;
+
   return (
     <div className="min-h-screen bg-slate-50">
-      {/* NOTE: The overlapping <header> was completely removed from here. 
-        Your global <Header /> from RootLayout will now sit perfectly at the top! 
-      */}
-
       <main className="max-w-5xl mx-auto p-6 pt-10">
         
-        {/* User Stats & Actions Bar (Moved from the old header) */}
+        {/* User Stats & Actions Bar */}
         <div className="flex justify-end items-center gap-4 mb-10 pb-6 border-b border-slate-200">
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-700 bg-white border border-slate-200 shadow-sm px-4 py-2 rounded-full">
+            <span className="text-yellow-500 text-base">⚡</span> {remainingCredits} / 3 Credits
+          </div>
           <div className="flex items-center gap-2 text-sm font-bold text-slate-700 bg-white border border-slate-200 shadow-sm px-4 py-2 rounded-full">
             <span className="text-orange-500 text-base">🔥</span> {streakCount || 0} Day Streak
           </div>
@@ -66,7 +76,7 @@ export default async function DashboardPage() {
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {roadmaps.map((roadmap) => (
+            {roadmaps.map((roadmap: { id: Key | null | undefined; topic: string; progress_percentage: any; created_at: string | number | Date; }) => (
               <div key={roadmap.id} className="group relative">
                 {/* Delete Action */}
                 <form 
