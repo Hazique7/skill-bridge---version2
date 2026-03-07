@@ -4,7 +4,6 @@ import Link from "next/link";
 import { Plus, Map, Trash2, Clock, ChevronRight, LogOut } from "lucide-react";
 import { deleteRoadmapAction } from "@/app/actions/roadmap";
 import { revalidatePath } from "next/cache";
-import { Key } from "react";
 
 export default async function DashboardPage() {
   const supabase = await createClient();
@@ -76,7 +75,7 @@ export default async function DashboardPage() {
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {roadmaps.map((roadmap: { id: Key | null | undefined; topic: string; progress_percentage: any; created_at: string | number | Date; }) => (
+            {roadmaps.map((roadmap: { id: string; topic: string; progress_percentage: number; created_at: string }) => (
               <div key={roadmap.id} className="group relative">
                 {/* Delete Action */}
                 <form 
