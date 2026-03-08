@@ -1,36 +1,27 @@
+export const dynamic = "force-dynamic";
+
 import { createClient } from "@/lib/supabase/server";
 import { redirect } from "next/navigation";
 import HomeClient from "./HomeClient";
 
-export default async function Home({ 
-  searchParams 
-}: { 
-  // In Next.js 15+, searchParams is a Promise!
+export default async function Home(props: { 
   searchParams: Promise<{ [key: string]: string | string[] | undefined }> 
 }) {
-  const supabase = await createClient();
-  
-  // 1. You MUST await the searchParams to read the URL
-  const resolvedParams = await searchParams;
-  const code = resolvedParams?.code;
+  const searchParams = await props.searchParams;
+  const code = searchParams?.code;
 
   // ==========================================================
-  // 2. THE TRAP: Catch the Supabase auth code
+  // THE NEW TRAP: Bounce the code to the API route!
   // ==========================================================
   if (typeof code === 'string') {
-    const { error } = await supabase.auth.exchangeCodeForSession(code);
-    
-    if (!error) {
-      // Success! Instantly redirect them to the dashboard
-      redirect("/dashboard");
-    } else {
-      console.error("Auth Trap Error:", error.message);
-    }
+    // This sends the code to your Route Handler, which is allowed to set the browser cookies
+    redirect(`/auth/callback?code=${code}`);
   }
 
   // ==========================================================
-  // 3. Normal Homepage Logic (Runs if there is no code)
+  // Normal Homepage Logic (Runs if there is no code)
   // ==========================================================
+  const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
 
   let remainingCredits = 3;
